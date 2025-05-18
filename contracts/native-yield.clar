@@ -221,3 +221,116 @@
     (ok true)
   )
 )
+
+;; Vault functions
+
+;; Create a new yield optimization vault
+(define-public (create-vault
+    (name (string-ascii 64))
+    (description (string-ascii 256))
+    (strategy (string-ascii 32))
+    (target-apy uint)
+    (risk-level uint)
+    (allocation (list 10 {
+      protocol-id: uint,
+      percentage: uint,
+    }))
+  )
+  (let (
+      (vault-id (var-get next-vault-id))
+      (total-percentage (fold + (map get-percentage allocation) u0))
+    )
+    ;; Validate input parameters
+    (asserts! (and (>= risk-level u1) (<= risk-level u10)) ERR-INVALID-PARAMETER)
+    (asserts! (is-eq total-percentage u100) ERR-INVALID-PARAMETER)
+    ;; Check all protocols in allocation exist and are active
+    (asserts! (validate-allocation allocation) ERR-INVALID-PROTOCOL)
+    ;; Create the vault
+    (map-set vaults { vault-id: vault-id } {
+      creator: tx-sender,
+      name: name,
+      description: description,
+      strategy: strategy,
+      target-apy: target-apy,
+      risk-level: risk-level,
+      allocation: allocation,
+      is-active: true,
+      total-assets-ustx: u0,
+      creation-height: block-height,
+    })
+    (var-set next-vault-id (+ vault-id u1))
+    (ok vault-id)
+  )
+)
+
+;; Helper function to extract percentage from allocation entry
+(define-private (get-percentage (entry {
+  protocol-id: uint,
+  percentage: uint,
+}))
+  (get percentage entry)
+)
+
+;; Validate that all protocols in allocation exist and are active
+(define-private (validate-allocation (allocation (list 10 {
+  protocol-id: uint,
+  percentage: uint,
+})))
+  (fold and (map validate-protocol-in-allocation allocation) true)
+)
+
+;; Validate a single protocol in allocation
+(define-private (validate-protocol-in-allocation (entry {
+  protocol-id: uint,
+  percentage: uint,
+}))
+  (match (map-get? protocols { protocol-id: (get protocol-id entry) })
+    protocol (get is-active protocol)
+    false
+  )
+)
+
+;; Deposit assets into a vault
+(define-public (deposit-to-vault
+    (vault-id uint)
+    (amount-ustx uint)
+  )
+  (let (
+      (vault (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-VAULT-NOT-FOUND))
+      (user-position (default-to {
+        amount-ustx: u0,
+        entry-height: block-height,
+        last-rebalance-height: block-height,
+        earnings-ustx: u0,
+        strategy-params: none,
+      }
+        (map-get? user-vault-positions {
+          user: tx-sender,
+          vault-id: vault-id,
+        })
+      ))
+    )
+    ;; Validate
+    (asserts! (get is-active vault) ERR-VAULT-NOT-FOUND)
+    (asserts! (> amount-ustx u0) ERR-INVALID-AMOUNT)
+    ;; Transfer STX to contract
+    (try! (stx-transfer? amount-ustx tx-sender (as-contract tx-sender)))
+    ;; Update user position
+    (map-set user-vault-positions {
+      user: tx-sender,
+      vault-id: vault-id,
+    }
+      (merge user-position {
+        amount-ustx: (+ (get amount-ustx user-position) amount-ustx),
+        last-rebalance-height: block-height,
+      })
+    )
+    ;; Update vault total assets
+    (map-set vaults { vault-id: vault-id }
+      (merge vault { total-assets-ustx: (+ (get total-assets-ustx vault) amount-ustx) })
+    )
+    ;; Allocate funds according to vault strategy
+    (try! (allocate-funds vault-id tx-sender amount-ustx))
+    (ok true)
+  )
+)
